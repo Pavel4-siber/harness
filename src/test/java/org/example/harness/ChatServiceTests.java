@@ -3,6 +3,7 @@ package org.example.harness;
 import org.junit.jupiter.api.Test;
 import org.springframework.ai.chat.messages.AssistantMessage;
 import org.springframework.ai.chat.messages.Message;
+import org.springframework.ai.chat.messages.MessageType;
 import org.springframework.ai.chat.model.ChatResponse;
 import org.springframework.ai.chat.model.Generation;
 import org.springframework.ai.chat.prompt.Prompt;
@@ -27,7 +28,7 @@ class ChatServiceTests {
         when(chatModel.call(any(Prompt.class)))
                 .thenReturn(response("First answer"))
                 .thenReturn(response("Second answer"));
-        ChatService chatService = new ChatService(chatModel, 20);
+        ChatService chatService = newService(chatModel, 20);
 
         assertThat(chatService.reply("conversation-1", "First question")).isEqualTo("First answer");
         assertThat(chatService.reply("conversation-1", "Second question")).isEqualTo("Second answer");
@@ -47,7 +48,7 @@ class ChatServiceTests {
                 .thenReturn(response("Answer 1"))
                 .thenReturn(response("Answer 2"))
                 .thenReturn(response("Answer 3"));
-        ChatService chatService = new ChatService(chatModel, 1);
+        ChatService chatService = newService(chatModel, 1);
 
         chatService.reply("conversation-1", "Question 1");
         chatService.reply("conversation-1", "Question 2");
@@ -65,7 +66,7 @@ class ChatServiceTests {
         when(chatModel.call(any(Prompt.class)))
                 .thenThrow(new IllegalStateException("model failed"))
                 .thenReturn(response("Recovered"));
-        ChatService chatService = new ChatService(chatModel, 20);
+        ChatService chatService = newService(chatModel, 20);
 
         assertThatThrownBy(() -> chatService.reply("conversation-1", "Failed question"))
                 .isInstanceOf(ChatModelException.class);
@@ -77,11 +78,62 @@ class ChatServiceTests {
                 .containsExactly("Retry question");
     }
 
+    @Test
+    void passesConfiguredModelSettingsToTheRequest() {
+        OllamaChatModel chatModel = mock(OllamaChatModel.class);
+        when(chatModel.call(any(Prompt.class))).thenReturn(response("Answer"));
+        ChatService chatService = new ChatService(chatModel, 20, 100, 60,
+                "test-model", 42, 0.5, "", "Europe/Moscow");
+
+        chatService.reply("conversation-1", "Question");
+
+        ArgumentCaptor<Prompt> promptCaptor = ArgumentCaptor.forClass(Prompt.class);
+        verify(chatModel).call(promptCaptor.capture());
+        assertThat(promptCaptor.getValue().getOptions().getModel()).isEqualTo("test-model");
+        assertThat(promptCaptor.getValue().getOptions().getMaxTokens()).isEqualTo(42);
+        assertThat(promptCaptor.getValue().getOptions().getTemperature()).isEqualTo(0.5);
+    }
+
+    @Test
+    void addsSystemPromptToEveryRequestWithoutStoringItInHistory() {
+        OllamaChatModel chatModel = mock(OllamaChatModel.class);
+        when(chatModel.call(any(Prompt.class)))
+                .thenReturn(response("A1"))
+                .thenReturn(response("A2"));
+        ChatService chatService = new ChatService(chatModel, 20, 100, 60,
+                "m", 42, 0.2, "  Be brief  ", "Europe/Moscow");
+
+        chatService.reply("conversation-1", "Q1");
+        chatService.reply("conversation-1", "Q2");
+
+        ArgumentCaptor<Prompt> promptCaptor = ArgumentCaptor.forClass(Prompt.class);
+        verify(chatModel, times(2)).call(promptCaptor.capture());
+        List<Message> second = promptCaptor.getAllValues().get(1).getInstructions();
+        assertThat(texts(promptCaptor.getAllValues().get(0).getInstructions()))
+                .containsExactly("Q1");
+        assertThat(texts(second)).containsExactly("Q1", "A1", "Q2");
+        assertThat(second.stream().filter(m -> m.getMessageType() == MessageType.SYSTEM).count())
+                .isEqualTo(1);
+        assertThat(second.get(0).getMessageType()).isEqualTo(MessageType.SYSTEM);
+        assertThat(second.get(0).getText())
+                .startsWith("Be brief")
+                .contains("Current date and time:")
+                .contains("Europe/Moscow");
+    }
+
+    private static ChatService newService(OllamaChatModel chatModel, int maxHistoryTurns) {
+        return new ChatService(chatModel, maxHistoryTurns, 1000, 60, "qwen3.5:4b",
+                512, 0.2, "", "Europe/Moscow");
+    }
+
     private static ChatResponse response(String answer) {
         return new ChatResponse(List.of(new Generation(new AssistantMessage(answer))));
     }
 
     private static List<String> texts(List<Message> messages) {
-        return messages.stream().map(Message::getText).toList();
+        return messages.stream()
+                .filter(message -> message.getMessageType() != MessageType.SYSTEM)
+                .map(Message::getText)
+                .toList();
     }
 }

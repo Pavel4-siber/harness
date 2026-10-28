@@ -8,6 +8,9 @@ services:
       - ollama-data:/root/.ollama
     networks:
       - harness-net
+    dns:
+      - 8.8.8.8
+      - 1.1.1.1
     environment:
       - OLLAMA_KEEP_ALIVE=30m
     healthcheck:
@@ -21,17 +24,18 @@ services:
     container_name: harness-ollama-pull
     volumes:
       - ollama-data:/root/.ollama
-      # ВАЖНО: Раскомментируйте для решения проблемы x509 / TLS
-      - /etc/ssl/certs:/etc/ssl/certs:ro
     networks:
       - harness-net
+    dns:
+      - 8.8.8.8
+      - 1.1.1.1
     depends_on:
       ollama:
         condition: service_healthy
     environment:
       - OLLAMA_HOST=http://ollama:11434
     entrypoint: /bin/sh
-    # Умная команда: скачивает ТОЛЬКО если модели qwen3.5:4b еще нет в списке
+    # Скачивает модель, только если qwen3.5:4b еще нет в списке
     command: >
       -c "
       if ollama list | grep -q 'qwen3.5:4b'; then
