@@ -19,6 +19,7 @@ import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 import org.mockito.ArgumentCaptor;
+import reactor.core.publisher.Flux;
 
 class ChatServiceTests {
 
@@ -119,6 +120,43 @@ class ChatServiceTests {
                 .startsWith("Be brief")
                 .contains("Current date and time:")
                 .contains("Europe/Moscow");
+    }
+
+    @Test
+    void streamsChunksAndStoresFullAnswerInHistory() {
+        OllamaChatModel chatModel = mock(OllamaChatModel.class);
+        when(chatModel.stream(any(Prompt.class))).thenReturn(Flux.just(response("Hel"), response("lo")));
+        when(chatModel.call(any(Prompt.class))).thenReturn(response("Next answer"));
+        ChatService chatService = newService(chatModel, 20);
+
+        List<String> chunks = chatService.stream("conversation-1", "Question").collectList().block();
+        chatService.reply("conversation-1", "Follow-up");
+
+        assertThat(chunks).containsExactly("Hel", "lo");
+        ArgumentCaptor<Prompt> promptCaptor = ArgumentCaptor.forClass(Prompt.class);
+        verify(chatModel).call(promptCaptor.capture());
+        assertThat(texts(promptCaptor.getValue().getInstructions()))
+                .containsExactly("Question", "Hello", "Follow-up");
+    }
+
+    @Test
+    void doesNotStoreTurnAndReleasesConversationWhenStreamFails() {
+        OllamaChatModel chatModel = mock(OllamaChatModel.class);
+        when(chatModel.stream(any(Prompt.class)))
+                .thenReturn(Flux.error(new IllegalStateException("model failed")));
+        when(chatModel.call(any(Prompt.class))).thenReturn(response("Recovered"));
+        ChatService chatService = newService(chatModel, 20);
+
+        assertThatThrownBy(() -> chatService.stream("conversation-1", "Failed question")
+                .collectList().block())
+                .isInstanceOf(ChatModelException.class);
+        // Если бы диалог остался занятым, этот вызов завис бы навсегда.
+        chatService.reply("conversation-1", "Retry question");
+
+        ArgumentCaptor<Prompt> promptCaptor = ArgumentCaptor.forClass(Prompt.class);
+        verify(chatModel).call(promptCaptor.capture());
+        assertThat(texts(promptCaptor.getValue().getInstructions()))
+                .containsExactly("Retry question");
     }
 
     private static ChatService newService(OllamaChatModel chatModel, int maxHistoryTurns) {

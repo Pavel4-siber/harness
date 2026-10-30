@@ -12,6 +12,8 @@ import org.springframework.ai.ollama.OllamaChatModel;
 import org.springframework.ai.ollama.api.OllamaChatOptions;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
+import reactor.core.publisher.Flux;
+import reactor.core.scheduler.Schedulers;
 
 import java.time.Duration;
 import java.time.ZoneId;
@@ -21,6 +23,7 @@ import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Locale;
+import java.util.concurrent.Semaphore;
 
 @Service
 public class ChatService {
@@ -103,6 +106,67 @@ public class ChatService {
         }
     }
 
+    public Flux<String> stream(String conversationId, String userMessage) {
+        return Flux.defer(() -> {
+            Conversation conversation = conversations.get(conversationId, ignored -> new Conversation());
+
+            conversation.lock.acquireUninterruptibly();
+            Flux<String> chunks;
+            try {
+                chunks = chatModel.stream(buildPrompt(conversation, userMessage))
+                        .map(ChatService::chunkText)
+                        .filter(text -> !text.isEmpty());
+            } catch (RuntimeException exception) {
+                conversation.lock.release();
+                throw new ChatModelException(exception);
+            }
+
+            StringBuilder answer = new StringBuilder();
+            return chunks
+                    .doOnNext(answer::append)
+                    .doOnComplete(() -> {
+                        String assistantMessage = answer.toString();
+                        if (assistantMessage.isBlank()) {
+                            throw new IllegalStateException("Model returned an empty response");
+                        }
+                        remember(conversation, userMessage, assistantMessage);
+                    })
+                    .onErrorMap(error -> error instanceof ChatModelException
+                            ? error
+                            : new ChatModelException(error))
+                    .doFinally(signal -> conversation.lock.release());
+        }).subscribeOn(Schedulers.boundedElastic());
+    }
+
+    private Prompt buildPrompt(Conversation conversation, String userMessage) {
+        List<Message> promptMessages = new ArrayList<>();
+        promptMessages.add(new SystemMessage(buildSystemMessage()));
+        promptMessages.addAll(conversation.history);
+        promptMessages.add(new UserMessage(userMessage));
+
+        OllamaChatOptions options = OllamaChatOptions.builder()
+                .model(model)
+                .numPredict(numPredict)
+                .temperature(temperature)
+                .disableThinking()
+                .build();
+        return new Prompt(promptMessages, options);
+    }
+
+    private void remember(Conversation conversation, String userMessage, String assistantMessage) {
+        conversation.history.addLast(new UserMessage(userMessage));
+        conversation.history.addLast(new AssistantMessage(assistantMessage));
+        trimHistory(conversation.history);
+    }
+
+    private static String chunkText(ChatResponse chunk) {
+        if (chunk == null || chunk.getResult() == null || chunk.getResult().getOutput() == null) {
+            return "";
+        }
+        String text = chunk.getResult().getOutput().getText();
+        return text == null ? "" : text;
+    }
+
     private String buildSystemMessage() {
         String timeInfo = "Current date and time: " + TIME_FORMAT.format(ZonedDateTime.now(zone))
                 + ". Use it when the user asks about the date or time.";
@@ -119,5 +183,6 @@ public class ChatService {
 
     private static final class Conversation {
         private final ArrayDeque<Message> history = new ArrayDeque<>();
+        private final Semaphore lock = new Semaphore(1);
     }
 }
