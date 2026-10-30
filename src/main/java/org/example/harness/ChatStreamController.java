@@ -23,7 +23,7 @@ public class ChatStreamController {
         this.chatService = chatService;
     }
 
-    @PostMapping(value = "/api/chat/stream", produces = MediaType.TEXT_EVENT_STREAM_VALUE)
+    @PostMapping(value = "/api/chat/stream", produces = {MediaType.TEXT_EVENT_STREAM_VALUE, MediaType.APPLICATION_JSON_VALUE})
     public Flux<ServerSentEvent<Map<String, String>>> stream(@Valid @RequestBody ChatRequest request) {
         String conversationId = request.conversationId() == null || request.conversationId().isBlank()
                 ? UUID.randomUUID().toString()

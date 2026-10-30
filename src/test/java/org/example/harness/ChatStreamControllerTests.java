@@ -94,8 +94,7 @@ class ChatStreamControllerTests {
     void returnsJsonValidationErrorBeforeStreamingStarts() throws Exception {
         mockMvc.perform(post("/api/chat/stream")
                         .contentType(MediaType.APPLICATION_JSON)
-                        .accept(MediaType.TEXT_EVENT_STREAM,
-                                MediaType.APPLICATION_JSON)
+                        .accept(MediaType.TEXT_EVENT_STREAM, MediaType.APPLICATION_JSON)
                         .content("{\"message\":\" \"}"))
                 .andExpect(status().isBadRequest())
                 .andExpect(content().contentTypeCompatibleWith(MediaType.APPLICATION_JSON))
