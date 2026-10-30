@@ -2,10 +2,13 @@ package org.example.harness;
 
 import com.github.benmanes.caffeine.cache.Cache;
 import com.github.benmanes.caffeine.cache.Caffeine;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.springframework.ai.chat.messages.AssistantMessage;
 import org.springframework.ai.chat.messages.Message;
 import org.springframework.ai.chat.messages.SystemMessage;
 import org.springframework.ai.chat.messages.UserMessage;
+import org.springframework.ai.chat.metadata.Usage;
 import org.springframework.ai.chat.model.ChatResponse;
 import org.springframework.ai.chat.prompt.Prompt;
 import org.springframework.ai.ollama.OllamaChatModel;
@@ -24,10 +27,12 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.Locale;
 import java.util.concurrent.Semaphore;
+import java.util.concurrent.atomic.AtomicReference;
 
 @Service
 public class ChatService {
 
+    private static final Logger log = LoggerFactory.getLogger(ChatService.class);
     private static final DateTimeFormatter TIME_FORMAT =
                     DateTimeFormatter.ofPattern("EEEE, yyyy-MM-dd HH:mm (VV, xxx)", Locale.ENGLISH);
 
@@ -110,10 +115,19 @@ public class ChatService {
         return Flux.defer(() -> {
             Conversation conversation = conversations.get(conversationId, ignored -> new Conversation());
 
+            // Ожидание блокирует поток, поэтому подписка идёт на boundedElastic (см. ниже).
             conversation.lock.acquireUninterruptibly();
+            AtomicReference<Usage> usage = new AtomicReference<>();
             Flux<String> chunks;
             try {
                 chunks = chatModel.stream(buildPrompt(conversation, userMessage))
+                        .doOnNext(chunk -> {
+                            // Счётчики токенов приходят в последнем кусочке потока.
+                            Usage chunkUsage = usageOf(chunk);
+                            if (chunkUsage != null) {
+                                usage.set(chunkUsage);
+                            }
+                        })
                         .map(ChatService::chunkText)
                         .filter(text -> !text.isEmpty());
             } catch (RuntimeException exception) {
@@ -129,6 +143,7 @@ public class ChatService {
                         if (assistantMessage.isBlank()) {
                             throw new IllegalStateException("Model returned an empty response");
                         }
+                        logUsage(conversationId, usage.get(), conversation.history.size());
                         remember(conversation, userMessage, assistantMessage);
                     })
                     .onErrorMap(error -> error instanceof ChatModelException
@@ -137,6 +152,29 @@ public class ChatService {
                     .doFinally(signal -> conversation.lock.release());
         }).subscribeOn(Schedulers.boundedElastic());
     }
+
+    private static Usage usageOf(ChatResponse response) {
+        if (response == null || response.getMetadata() == null) {
+            return null;
+        }
+        return response.getMetadata().getUsage();
+    }
+
+    private void logUsage(String conversationId, Usage usage, int historyMessages) {
+        if (usage == null) {
+            return;
+        }
+        Integer promptTokens = usage.getPromptTokens();
+        Integer completionTokens = usage.getCompletionTokens();
+        log.info("Chat usage: conversation={}, promptTokens={}, completionTokens={}, "
+                        + "historyMessages={}, numPredict={}",
+                conversationId, promptTokens, completionTokens, historyMessages, numPredict);
+        if (completionTokens != null && completionTokens >= numPredict) {
+            log.warn("Reply for conversation={} reached num-predict={} and was probably cut off",
+                    conversationId, numPredict);
+        }
+    }
+
 
     private Prompt buildPrompt(Conversation conversation, String userMessage) {
         List<Message> promptMessages = new ArrayList<>();
