@@ -96,43 +96,6 @@ public class ChatService {
                 .build();
     }
 
-    public String reply(String conversationId, String userMessage) {
-        Conversation conversation = conversations.get(conversationId, ignored -> new Conversation());
-
-        conversation.lock.acquireUninterruptibly();
-        try {
-            List<Message> promptMessages = new ArrayList<>();
-            promptMessages.add(new SystemMessage(buildSystemMessage()));
-            promptMessages.addAll(conversation.history);
-            promptMessages.add(new UserMessage(userMessage));
-
-            final String assistantMessage;
-            try {
-                OllamaChatOptions options = OllamaChatOptions.builder()
-                        .model(model)
-                        .numPredict(numPredict)
-                        .temperature(temperature)
-                        .disableThinking()
-                        .build();
-                ChatResponse response = chatModel.call(new Prompt(promptMessages, options));
-                assistantMessage = response.getResult().getOutput().getText();
-                if (assistantMessage == null || assistantMessage.isBlank()) {
-                    throw new IllegalStateException("Model returned an empty response");
-                }
-            } catch (RuntimeException exception) {
-                throw new ChatModelException(exception);
-            }
-
-            conversation.history.addLast(new UserMessage(userMessage));
-            conversation.history.addLast(new AssistantMessage(assistantMessage));
-            trimHistory(conversation.history);
-
-            return assistantMessage;
-        } finally {
-            conversation.lock.release();
-        }
-    }
-
     public Flux<String> stream(String conversationId, String userMessage) {
         return Flux.defer(() -> {
             Conversation conversation = conversations.get(conversationId, ignored -> new Conversation());
@@ -150,7 +113,7 @@ public class ChatService {
                             }
                         })
                         .map(ChatService::chunkText)
-                        .filter(text -> !text.isEmpty());
+                        .filter(text -> !text.isBlank());
             } catch (RuntimeException exception) {
                 conversation.lock.release();
                 throw new ChatModelException(exception);
@@ -198,8 +161,9 @@ public class ChatService {
 
     private Prompt buildPrompt(Conversation conversation, String userMessage) {
         List<Message> promptMessages = new ArrayList<>();
-        promptMessages.add(new SystemMessage(buildSystemMessage()));
+        promptMessages.add(new SystemMessage(buildSystemPrompt()));
         promptMessages.addAll(conversation.history);
+        promptMessages.add(new SystemMessage(buildTimeContext()));
         promptMessages.add(new UserMessage(userMessage));
 
         OllamaChatOptions options = OllamaChatOptions.builder()
@@ -225,10 +189,13 @@ public class ChatService {
         return text == null ? "" : text;
     }
 
-    private String buildSystemMessage() {
-        String timeInfo = "Current date and time: " + TIME_FORMAT.format(ZonedDateTime.now(zone))
+    private String buildSystemPrompt() {
+        return systemPrompt;
+    }
+
+    private String buildTimeContext() {
+        return "Current date and time: " + TIME_FORMAT.format(ZonedDateTime.now(zone))
                 + ". Use it when the user asks about the date or time.";
-        return systemPrompt.isEmpty() ? timeInfo : systemPrompt + "\n\n" + timeInfo;
     }
 
     private void trimHistory(ArrayDeque<Message> history) {

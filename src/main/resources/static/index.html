@@ -1,0 +1,276 @@
+<!doctype html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta name="theme-color" content="#101828">
+    <title>Local chat</title>
+    <style>
+        :root {
+            color-scheme: dark;
+            --bg: #101828;
+            --panel: #172033;
+            --panel-2: #202c43;
+            --text: #edf2f7;
+            --muted: #9ba8bc;
+            --accent: #58d5a8;
+            --danger: #ff7b8d;
+            --border: rgba(237, 242, 247, .12);
+            font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+        }
+
+        * { box-sizing: border-box; }
+        body { margin: 0; min-width: 320px; background: var(--bg); color: var(--text); }
+        button, textarea { font: inherit; }
+
+        .app { display: grid; grid-template-rows: auto 1fr auto; height: 100dvh; max-width: 920px; margin: 0 auto; }
+        header { display: flex; align-items: center; justify-content: space-between; gap: 16px; padding: 18px 20px; border-bottom: 1px solid var(--border); }
+        h1 { margin: 0; font-size: 18px; letter-spacing: -.02em; }
+        .status { color: var(--muted); font-size: 13px; }
+
+        .ghost, .send, .stop {
+            border: 0; border-radius: 10px; cursor: pointer; padding: 9px 13px; transition: opacity .15s, transform .15s;
+        }
+        button:hover { transform: translateY(-1px); }
+        button:disabled { cursor: not-allowed; opacity: .5; transform: none; }
+        .ghost { background: transparent; color: var(--text); border: 1px solid var(--border); }
+        .send { background: var(--accent); color: #06291d; font-weight: 700; }
+        .stop { background: rgba(255, 123, 141, .15); color: #ffc0c9; }
+
+        main { overflow-y: auto; padding: 26px 20px; scroll-behavior: smooth; }
+        .empty { max-width: 560px; margin: 12vh auto 0; text-align: center; color: var(--muted); }
+        .empty h2 { color: var(--text); margin-bottom: 8px; }
+        .message { display: flex; margin: 0 0 18px; }
+        .message.user { justify-content: flex-end; }
+        .bubble { max-width: min(760px, 84%); padding: 12px 15px; border: 1px solid var(--border); border-radius: 16px; white-space: pre-wrap; overflow-wrap: anywhere; line-height: 1.5; }
+        .assistant .bubble { background: var(--panel); border-top-left-radius: 4px; }
+        .user .bubble { background: var(--panel-2); border-top-right-radius: 4px; }
+        .bubble.partial::after { content: "▋"; color: var(--accent); animation: blink .8s step-end infinite; }
+        .message-tools { display: flex; align-items: end; padding: 0 7px; }
+        .copy { color: var(--muted); padding: 4px; background: none; border: 0; cursor: pointer; font-size: 13px; }
+        .error { margin: 0 0 18px; padding: 10px 13px; color: #ffc0c9; border: 1px solid rgba(255, 123, 141, .35); background: rgba(255, 123, 141, .1); border-radius: 10px; }
+
+        footer { padding: 14px 20px 20px; border-top: 1px solid var(--border); background: rgba(16, 24, 40, .94); }
+        form { display: grid; grid-template-columns: 1fr auto auto; gap: 10px; align-items: end; }
+        textarea { width: 100%; min-height: 48px; max-height: 180px; resize: vertical; padding: 13px; color: var(--text); background: var(--panel); border: 1px solid var(--border); border-radius: 12px; outline: none; }
+        textarea:focus { border-color: var(--accent); box-shadow: 0 0 0 3px rgba(88, 213, 168, .12); }
+        .hint { display: flex; justify-content: space-between; gap: 10px; margin-top: 7px; color: var(--muted); font-size: 12px; }
+
+        @keyframes blink { 50% { opacity: 0; } }
+        @media (max-width: 560px) {
+            header, main, footer { padding-left: 14px; padding-right: 14px; }
+            form { grid-template-columns: 1fr auto; }
+            textarea { grid-column: 1 / -1; }
+            .stop { grid-column: 1; }
+            .send { grid-column: 2; }
+            .bubble { max-width: 92%; }
+        }
+    </style>
+</head>
+<body>
+<div class="app">
+    <header>
+        <div>
+            <h1>Local chat</h1>
+            <div id="status" class="status">Готов к диалогу</div>
+        </div>
+        <button id="new-chat" class="ghost" type="button">Новый диалог</button>
+    </header>
+
+    <main id="messages" aria-live="polite"></main>
+
+    <footer>
+        <form id="chat-form">
+            <textarea id="message" maxlength="8000" placeholder="Напишите сообщение…" aria-label="Сообщение"></textarea>
+            <button id="stop" class="stop" type="button" hidden>Стоп</button>
+            <button id="send" class="send" type="submit">Отправить</button>
+        </form>
+        <div class="hint"><span>Enter — отправить · Shift+Enter — новая строка</span><span id="counter">0 / 8000</span></div>
+    </footer>
+</div>
+
+<script>
+    const storageKey = "harness-chat-state-v1";
+    const messagesElement = document.querySelector("#messages");
+    const form = document.querySelector("#chat-form");
+    const input = document.querySelector("#message");
+    const sendButton = document.querySelector("#send");
+    const stopButton = document.querySelector("#stop");
+    const newChatButton = document.querySelector("#new-chat");
+    const statusElement = document.querySelector("#status");
+    const counter = document.querySelector("#counter");
+
+    let state = loadState();
+    let controller = null;
+
+    function loadState() {
+        try {
+            const parsed = JSON.parse(localStorage.getItem(storageKey));
+            if (parsed && Array.isArray(parsed.messages)) return parsed;
+        } catch (_) { /* Start with an empty conversation. */ }
+        return { conversationId: null, messages: [] };
+    }
+
+    function saveState() {
+        localStorage.setItem(storageKey, JSON.stringify(state));
+    }
+
+    function render() {
+        messagesElement.replaceChildren();
+        if (state.messages.length === 0) {
+            const empty = document.createElement("section");
+            empty.className = "empty";
+            empty.innerHTML = "<h2>Начните диалог</h2><p>Ответ появится по мере генерации локальной моделью.</p>";
+            messagesElement.append(empty);
+            return;
+        }
+
+        state.messages.forEach((message, index) => {
+            const item = document.createElement("article");
+            item.className = `message ${message.role}`;
+            const bubble = document.createElement("div");
+            bubble.className = `bubble${message.partial ? " partial" : ""}`;
+            bubble.textContent = message.text;
+            item.append(bubble);
+            if (message.role === "assistant" && message.text) {
+                const tools = document.createElement("div");
+                tools.className = "message-tools";
+                const copy = document.createElement("button");
+                copy.className = "copy";
+                copy.type = "button";
+                copy.textContent = "Копировать";
+                copy.addEventListener("click", async () => {
+                    await navigator.clipboard.writeText(state.messages[index].text);
+                    copy.textContent = "Скопировано";
+                    setTimeout(() => copy.textContent = "Копировать", 1200);
+                });
+                tools.append(copy);
+                item.append(tools);
+            }
+            messagesElement.append(item);
+        });
+        messagesElement.scrollTop = messagesElement.scrollHeight;
+    }
+
+    function showError(message) {
+        const error = document.createElement("div");
+        error.className = "error";
+        error.textContent = message;
+        messagesElement.append(error);
+        messagesElement.scrollTop = messagesElement.scrollHeight;
+    }
+
+    function setStreaming(active) {
+        sendButton.disabled = active;
+        input.disabled = active;
+        stopButton.hidden = !active;
+        statusElement.textContent = active ? "Модель отвечает…" : "Готов к диалогу";
+    }
+
+    function updateCounter() {
+        counter.textContent = `${input.value.length} / 8000`;
+    }
+
+    function handleSseEvent(name, rawData, assistant) {
+        let data = {};
+        try { data = rawData ? JSON.parse(rawData) : {}; } catch (_) { throw new Error("Некорректный ответ сервера"); }
+        if (name === "meta") {
+            state.conversationId = data.conversationId;
+            saveState();
+        } else if (name === "token") {
+            assistant.text += data.text || "";
+            render();
+        } else if (name === "error") {
+            throw new Error(data.message || data.code || "Ошибка модели");
+        }
+    }
+
+    async function sendMessage(text) {
+        controller = new AbortController();
+        const assistant = { role: "assistant", text: "", partial: true };
+        state.messages.push({ role: "user", text }, assistant);
+        saveState();
+        render();
+        setStreaming(true);
+
+        try {
+            const response = await fetch("/api/chat/stream", {
+                method: "POST",
+                headers: { "Content-Type": "application/json", "Accept": "text/event-stream" },
+                body: JSON.stringify({ message: text, conversationId: state.conversationId || undefined }),
+                signal: controller.signal
+            });
+            if (!response.ok || !response.body) {
+                const error = await response.json().catch(() => ({}));
+                throw new Error(error.message || `Сервер вернул HTTP ${response.status}`);
+            }
+
+            const reader = response.body.getReader();
+            const decoder = new TextDecoder();
+            let buffer = "";
+            while (true) {
+                const { value, done } = await reader.read();
+                if (done) break;
+                buffer += decoder.decode(value, { stream: true }).replace(/\r\n/g, "\n");
+                let separator;
+                while ((separator = buffer.indexOf("\n\n")) !== -1) {
+                    const frame = buffer.slice(0, separator);
+                    buffer = buffer.slice(separator + 2);
+                    let eventName = "message";
+                    const data = [];
+                    frame.split("\n").forEach(line => {
+                        if (line.startsWith("event:")) eventName = line.slice(6).trim();
+                        if (line.startsWith("data:")) data.push(line.slice(5).trimStart());
+                    });
+                    handleSseEvent(eventName, data.join("\n"), assistant);
+                }
+            }
+            assistant.partial = false;
+            saveState();
+            render();
+        } catch (error) {
+            state.messages = state.messages.filter(message => message !== assistant);
+            saveState();
+            render();
+            if (error.name === "AbortError") {
+                showError("Генерация остановлена. Сообщение не добавлено в историю модели.");
+            } else {
+                showError(error.message || "Не удалось получить ответ от модели.");
+            }
+        } finally {
+            controller = null;
+            setStreaming(false);
+            input.focus();
+        }
+    }
+
+    form.addEventListener("submit", event => {
+        event.preventDefault();
+        const text = input.value.trim();
+        if (!text || controller) return;
+        input.value = "";
+        updateCounter();
+        sendMessage(text);
+    });
+
+    input.addEventListener("input", updateCounter);
+    input.addEventListener("keydown", event => {
+        if (event.key === "Enter" && !event.shiftKey) {
+            event.preventDefault();
+            form.requestSubmit();
+        }
+    });
+    stopButton.addEventListener("click", () => controller?.abort());
+    newChatButton.addEventListener("click", () => {
+        if (controller || !confirm("Начать новый диалог?")) return;
+        state = { conversationId: null, messages: [] };
+        saveState();
+        render();
+        input.focus();
+    });
+
+    updateCounter();
+    render();
+</script>
+</body>
+</html>
