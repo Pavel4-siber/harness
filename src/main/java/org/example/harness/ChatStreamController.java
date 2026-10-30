@@ -13,9 +13,6 @@ import reactor.core.publisher.Flux;
 import java.util.Map;
 import java.util.UUID;
 
-import static org.springframework.web.servlet.mvc.method.annotation.SseEmitter.event;
-import static reactor.netty.http.HttpConnectionLiveness.log;
-
 @RestController
 public class ChatStreamController {
 

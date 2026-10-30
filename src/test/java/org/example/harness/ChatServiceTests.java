@@ -1,5 +1,6 @@
 package org.example.harness;
 
+import com.github.benmanes.caffeine.cache.Ticker;
 import org.junit.jupiter.api.Test;
 import org.springframework.ai.chat.messages.AssistantMessage;
 import org.springframework.ai.chat.messages.Message;
@@ -9,12 +10,18 @@ import org.springframework.ai.chat.model.Generation;
 import org.springframework.ai.chat.prompt.Prompt;
 import org.springframework.ai.ollama.OllamaChatModel;
 
+import java.time.Duration;
 import java.util.List;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicLong;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.after;
 import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
@@ -157,6 +164,107 @@ class ChatServiceTests {
         verify(chatModel).call(promptCaptor.capture());
         assertThat(texts(promptCaptor.getValue().getInstructions()))
                 .containsExactly("Retry question");
+    }
+
+    @Test
+    void doesNotStoreTurnWhenStreamCompletesWithoutText() {
+        OllamaChatModel chatModel = mock(OllamaChatModel.class);
+        when(chatModel.stream(any(Prompt.class))).thenReturn(Flux.empty());
+        when(chatModel.call(any(Prompt.class))).thenReturn(response("Recovered"));
+        ChatService chatService = newService(chatModel, 20);
+
+        assertThatThrownBy(() -> chatService.stream("conversation-1", "Empty reply")
+                .collectList().block())
+                .isInstanceOf(ChatModelException.class);
+
+        chatService.reply("conversation-1", "Retry question");
+
+        ArgumentCaptor<Prompt> promptCaptor = ArgumentCaptor.forClass(Prompt.class);
+        verify(chatModel).call(promptCaptor.capture());
+        assertThat(texts(promptCaptor.getValue().getInstructions()))
+                .containsExactly("Retry question");
+    }
+
+    @Test
+    void releasesConversationAndDoesNotStoreTurnWhenStreamIsCancelled() throws Exception {
+        OllamaChatModel chatModel = mock(OllamaChatModel.class);
+        CountDownLatch firstChunkSent = new CountDownLatch(1);
+        when(chatModel.stream(any(Prompt.class))).thenReturn(Flux.create(sink -> {
+            sink.next(response("Partial"));
+            firstChunkSent.countDown();
+        }));
+        when(chatModel.call(any(Prompt.class))).thenReturn(response("Recovered"));
+        ChatService chatService = newService(chatModel, 20);
+
+        var subscription = chatService.stream("conversation-1", "Cancelled question").subscribe();
+        assertThat(firstChunkSent.await(2, TimeUnit.SECONDS)).isTrue();
+        subscription.dispose();
+
+        assertThat(CompletableFuture.supplyAsync(() -> chatService.reply("conversation-1", "Retry question"))
+                .get(2, TimeUnit.SECONDS)).isEqualTo("Recovered");
+
+        ArgumentCaptor<Prompt> promptCaptor = ArgumentCaptor.forClass(Prompt.class);
+        verify(chatModel).call(promptCaptor.capture());
+        assertThat(texts(promptCaptor.getValue().getInstructions()))
+                .containsExactly("Retry question");
+    }
+
+    @Test
+    void serializesStreamingAndBlockingRequestsForTheSameConversation() throws Exception {
+        OllamaChatModel chatModel = mock(OllamaChatModel.class);
+        CountDownLatch streamStarted = new CountDownLatch(1);
+        CountDownLatch releaseStream = new CountDownLatch(1);
+        when(chatModel.stream(any(Prompt.class))).thenReturn(Flux.create(sink -> {
+            streamStarted.countDown();
+            try {
+                releaseStream.await();
+                sink.next(response("Stream answer"));
+                sink.complete();
+            } catch (InterruptedException exception) {
+                Thread.currentThread().interrupt();
+                sink.error(exception);
+            }
+        }));
+        when(chatModel.call(any(Prompt.class))).thenReturn(response("Blocking answer"));
+        ChatService chatService = newService(chatModel, 20);
+
+        CompletableFuture<List<String>> streaming = CompletableFuture.supplyAsync(() ->
+                chatService.stream("conversation-1", "Streaming question").collectList().block());
+        assertThat(streamStarted.await(2, TimeUnit.SECONDS)).isTrue();
+
+        CompletableFuture<String> blocking = CompletableFuture.supplyAsync(() ->
+                chatService.reply("conversation-1", "Blocking question"));
+        verify(chatModel, after(200).never()).call(any(Prompt.class));
+
+        releaseStream.countDown();
+        assertThat(streaming.get(2, TimeUnit.SECONDS)).containsExactly("Stream answer");
+        assertThat(blocking.get(2, TimeUnit.SECONDS)).isEqualTo("Blocking answer");
+
+        ArgumentCaptor<Prompt> promptCaptor = ArgumentCaptor.forClass(Prompt.class);
+        verify(chatModel).call(promptCaptor.capture());
+        assertThat(texts(promptCaptor.getValue().getInstructions()))
+                .containsExactly("Streaming question", "Stream answer", "Blocking question");
+    }
+
+    @Test
+    void startsNewConversationAfterTtlExpires() {
+        OllamaChatModel chatModel = mock(OllamaChatModel.class);
+        when(chatModel.call(any(Prompt.class)))
+                .thenReturn(response("First answer"))
+                .thenReturn(response("Second answer"));
+        AtomicLong now = new AtomicLong();
+        Ticker ticker = now::get;
+        ChatService chatService = new ChatService(chatModel, 20, 1000, Duration.ofMinutes(1),
+                "qwen3.5:4b", 512, 0.2, "", "Europe/Moscow", ticker);
+
+        chatService.reply("conversation-1", "First question");
+        now.addAndGet(Duration.ofMinutes(2).toNanos());
+        chatService.reply("conversation-1", "Second question");
+
+        ArgumentCaptor<Prompt> promptCaptor = ArgumentCaptor.forClass(Prompt.class);
+        verify(chatModel, times(2)).call(promptCaptor.capture());
+        assertThat(texts(promptCaptor.getAllValues().get(1).getInstructions()))
+                .containsExactly("Second question");
     }
 
     private static ChatService newService(OllamaChatModel chatModel, int maxHistoryTurns) {

@@ -43,9 +43,7 @@ docker exec harness-ollama ollama list
 .\mvnw.cmd spring-boot:run
 ```
 
-Приложение запустится на `http://localhost:8080`. По этому адресу открывается простая страница-чат, которая использует потоковый API: ответ появляется по мере генерации, а диалог сохраняется между сообщениями.
-
-Spring AI 2.1.0-M1 — milestone-версия, поэтому в `pom.xml` подключён репозиторий Spring Milestones (`https://repo.spring.io/milestone`).
+Проект использует стабильный Spring AI 2.0.2 из Maven Central.
 
 ## Настройка
 

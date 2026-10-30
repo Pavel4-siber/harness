@@ -2,6 +2,7 @@ package org.example.harness;
 
 import com.github.benmanes.caffeine.cache.Cache;
 import com.github.benmanes.caffeine.cache.Caffeine;
+import com.github.benmanes.caffeine.cache.Ticker;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.ai.chat.messages.AssistantMessage;
@@ -13,6 +14,7 @@ import org.springframework.ai.chat.model.ChatResponse;
 import org.springframework.ai.chat.prompt.Prompt;
 import org.springframework.ai.ollama.OllamaChatModel;
 import org.springframework.ai.ollama.api.OllamaChatOptions;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
 import reactor.core.publisher.Flux;
@@ -45,6 +47,7 @@ public class ChatService {
     private final String systemPrompt;
     private final Cache<String, Conversation> conversations;
 
+    @Autowired
     public ChatService(
             OllamaChatModel chatModel,
             @Value("${app.chat.max-history-turns:20}") int maxHistoryTurns,
@@ -55,13 +58,28 @@ public class ChatService {
             @Value("${spring.ai.ollama.chat.options.temperature:0.2}") double temperature,
             @Value("${app.chat.system-prompt:}") String systemPrompt,
             @Value("${app.chat.timezone:Europe/Moscow}") String timezone) {
+        this(chatModel, maxHistoryTurns, maxConversations, Duration.ofMinutes(ttlMinutes), model,
+                numPredict, temperature, systemPrompt, timezone, Ticker.systemTicker());
+    }
+
+    ChatService(
+            OllamaChatModel chatModel,
+            int maxHistoryTurns,
+            long maxConversations,
+            Duration conversationTtl,
+            String model,
+            int numPredict,
+            double temperature,
+            String systemPrompt,
+            String timezone,
+            Ticker ticker) {
         if (maxHistoryTurns < 1) {
             throw new IllegalArgumentException("app.chat.max-history-turns must be at least 1");
         }
         if (maxConversations < 1) {
             throw new IllegalArgumentException("app.chat.max-conversations must be at least 1");
         }
-        if (ttlMinutes < 1) {
+        if (conversationTtl.isNegative() || conversationTtl.isZero()) {
             throw new IllegalArgumentException("app.chat.conversation-ttl-minutes must be at least 1");
         }
         this.chatModel = chatModel;
@@ -73,14 +91,16 @@ public class ChatService {
         this.zone = ZoneId.of(timezone);
         this.conversations = Caffeine.newBuilder()
                 .maximumSize(maxConversations)
-                .expireAfterAccess(Duration.ofMinutes(ttlMinutes))
+                .expireAfterAccess(conversationTtl)
+                .ticker(ticker)
                 .build();
     }
 
     public String reply(String conversationId, String userMessage) {
         Conversation conversation = conversations.get(conversationId, ignored -> new Conversation());
 
-        synchronized (conversation) {
+        conversation.lock.acquireUninterruptibly();
+        try {
             List<Message> promptMessages = new ArrayList<>();
             promptMessages.add(new SystemMessage(buildSystemMessage()));
             promptMessages.addAll(conversation.history);
@@ -108,6 +128,8 @@ public class ChatService {
             trimHistory(conversation.history);
 
             return assistantMessage;
+        } finally {
+            conversation.lock.release();
         }
     }
 
@@ -173,7 +195,6 @@ public class ChatService {
                     conversationId, numPredict);
         }
     }
-
 
     private Prompt buildPrompt(Conversation conversation, String userMessage) {
         List<Message> promptMessages = new ArrayList<>();
