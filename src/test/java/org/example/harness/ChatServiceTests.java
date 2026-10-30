@@ -150,7 +150,7 @@ class ChatServiceTests {
         assertThatThrownBy(() -> chatService.stream("conversation-1", "Failed question")
                 .collectList().block())
                 .isInstanceOf(ChatModelException.class);
-        // Если бы диалог остался занятым, этот вызов завис бы навсегда.
+
         chatService.reply("conversation-1", "Retry question");
 
         ArgumentCaptor<Prompt> promptCaptor = ArgumentCaptor.forClass(Prompt.class);

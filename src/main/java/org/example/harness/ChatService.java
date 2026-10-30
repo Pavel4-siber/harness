@@ -115,14 +115,13 @@ public class ChatService {
         return Flux.defer(() -> {
             Conversation conversation = conversations.get(conversationId, ignored -> new Conversation());
 
-            // Ожидание блокирует поток, поэтому подписка идёт на boundedElastic (см. ниже).
             conversation.lock.acquireUninterruptibly();
             AtomicReference<Usage> usage = new AtomicReference<>();
             Flux<String> chunks;
             try {
                 chunks = chatModel.stream(buildPrompt(conversation, userMessage))
                         .doOnNext(chunk -> {
-                            // Счётчики токенов приходят в последнем кусочке потока.
+
                             Usage chunkUsage = usageOf(chunk);
                             if (chunkUsage != null) {
                                 usage.set(chunkUsage);
