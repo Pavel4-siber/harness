@@ -17,7 +17,6 @@ import org.springframework.ai.ollama.api.OllamaChatOptions;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Service;
 import reactor.core.publisher.Flux;
-import reactor.core.publisher.Mono;
 import reactor.core.scheduler.Schedulers;
 
 import java.time.ZoneId;
@@ -29,7 +28,6 @@ import java.util.List;
 import java.util.Locale;
 import java.util.concurrent.Semaphore;
 import java.util.concurrent.atomic.AtomicReference;
-import java.util.stream.Collectors;
 
 @Service("chatService")
 public class ChatService {
@@ -76,6 +74,7 @@ public class ChatService {
 
                     conversation.lock.acquireUninterruptibly(); // блокирование
                     AtomicReference<Usage> usage = new AtomicReference<>();
+                    StringBuilder fullAnswer = new StringBuilder();
 
                     Flux<String> chunks;
                     try {
@@ -93,22 +92,35 @@ public class ChatService {
                         conversation.lock.release();
                         throw new ChatModelException(exception);
                     }
-                    Mono<String> fullAnswerMono = chunks.collect(Collectors.joining()); //потоковая обработка внутри сервиса, но не потоковая выдача ответа клиенту.
 
-            return fullAnswerMono
-                    .flatMap(assistantMessage -> {
-                        logUsage(conversationId, usage.get(), conversation.history.size());
-                        if (assistantMessage.isBlank())
-                        {
-                            assistantMessage = "Я пока не смог сформировать ответ.";
-                        }
-                        remember(conversation, userMessage, assistantMessage);
-                        return Mono.just(assistantMessage); })
-                    .flux()
-                    .onErrorMap(error -> error instanceof ChatModelException ? error : new ChatModelException("Error streaming chat response", error))
+                    return chunks
+                            // Если модель не вернула текст, отправляем fallback
+                            .switchIfEmpty(Flux.just(
+                                    "Я пока не смог сформировать ответ."))
+
+                            // Накопление полного ответа, не задерживая отправку chunks
+                            .doOnNext(fullAnswer::append)
+
+                            // Историю сохраняем только после успешного завершения потока
+                            .doOnComplete(() -> {
+                                logUsage(
+                                        conversationId,
+                                        usage.get(),
+                                        conversation.history.size()
+                                );
+                                remember(conversation, userMessage, fullAnswer.toString());
+                            })
+
+                    .onErrorMap(error ->
+                            error instanceof ChatModelException
+                                    ? error
+                                    : new ChatModelException("Error streaming chat response",
+                                    error
+                            )
+                    )
                     .doFinally(signal -> conversation.lock.release()); //снятие блокировки
-        })
-                .subscribeOn(Schedulers.boundedElastic());
+
+        }).subscribeOn(Schedulers.boundedElastic());
     }
 
     private Prompt buildPrompt(Conversation conversation, String userMessage) {
