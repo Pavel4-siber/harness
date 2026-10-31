@@ -45,6 +45,10 @@ public class ChatService {
 
     @Autowired
     public ChatService(OllamaChatModel chatModel, ChatProperties props) {
+        log.info("Model: {}", props.getDefaultModel());
+        log.info("Temperature: {}", props.getDefaultTemperature());
+        log.info("System prompt: '{}'", props.getDefaultSystemPrompt());
+        log.info("Conversation TTL: {}", props.getConversationTtl());
         if (props.getConversationTtl().isNegative() || props.getConversationTtl().isZero()) {
             throw new IllegalArgumentException("app.chat.conversation-ttl must be positive");
         }

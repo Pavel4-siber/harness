@@ -1,10 +1,20 @@
+spring:
+  application:
+    name: harness
+  ai:
+    ollama:
+      base-url: http://localhost:11431
+  mvc:
+    async:
+      request-timeout: 15m
+
 app:
   chat:
     max-history-turns: 20
     max-conversations: 1000
-    conversation-ttl-minutes: 60
+    conversation-ttl: PT60M
     timezone: Europe/Moscow
-    model: qwen3.5:4b
-    num-predict: 512
-    temperature: 0.2
-    system-prompt: "You are a helpful assistant."
+    default-model: qwen3.5:4b
+    default-num-predict: 512
+    default-temperature: 0.2
+    default-system-prompt: "You are a helpful assistant."

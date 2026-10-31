@@ -67,9 +67,7 @@ docker exec harness-ollama ollama list
 | `CHAT_SYSTEM_PROMPT` | Краткий промпт на английском (см. `application.properties`) | Системный промпт для каждого запроса к модели; пустое значение отключает его |
 | `CHAT_TIMEZONE` | `Europe/Moscow` | Часовой пояс для текущих даты и времени, которые передаются модели |
 
-Модель, `num-predict` и `temperature` задаются в `application.properties` (`spring.ai.ollama.chat.options.*`). Приложение передаёт их в каждый запрос явно.
-
-Для потоковых ответов в `application.properties` задано `spring.mvc.async.request-timeout=15m`: это увеличивает время ожидания асинхронного запроса в Spring MVC.
+Модель и другие настройки задаются в `application.yml`. Приложение передаёт их в каждый запрос явно.
 
 Пример настройки в PowerShell:
 
@@ -82,8 +80,6 @@ $env:CHAT_TIMEZONE = "Europe/Moscow"
 
 .\mvnw.cmd spring-boot:run
 ```
-
-Файл `application.properties` должен быть сохранён в UTF-8. Если в нём появится кириллица, проверьте кодировку проекта в IDE, иначе вместо букв могут отображаться `?`.
 
 ## API диалога
 
