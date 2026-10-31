@@ -1,0 +1,10 @@
+app:
+  chat:
+    max-history-turns: 20
+    max-conversations: 1000
+    conversation-ttl-minutes: 60
+    timezone: Europe/Moscow
+    model: qwen3.5:4b
+    num-predict: 512
+    temperature: 0.2
+    system-prompt: "You are a helpful assistant."

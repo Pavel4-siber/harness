@@ -15,12 +15,11 @@ import org.springframework.ai.chat.prompt.Prompt;
 import org.springframework.ai.ollama.OllamaChatModel;
 import org.springframework.ai.ollama.api.OllamaChatOptions;
 import org.springframework.beans.factory.annotation.Autowired;
-import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
 import reactor.core.publisher.Flux;
+import reactor.core.publisher.Mono;
 import reactor.core.scheduler.Schedulers;
 
-import java.time.Duration;
 import java.time.ZoneId;
 import java.time.ZonedDateTime;
 import java.time.format.DateTimeFormatter;
@@ -30,118 +29,99 @@ import java.util.List;
 import java.util.Locale;
 import java.util.concurrent.Semaphore;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.stream.Collectors;
 
-@Service
+@Service("chatService")
 public class ChatService {
 
     private static final Logger log = LoggerFactory.getLogger(ChatService.class);
     private static final DateTimeFormatter TIME_FORMAT =
-                    DateTimeFormatter.ofPattern("EEEE, yyyy-MM-dd HH:mm (VV, xxx)", Locale.ENGLISH);
+            DateTimeFormatter.ofPattern("EEEE, yyyy-MM-dd HH:mm (VV, xxx)", Locale.ENGLISH);
 
     private final OllamaChatModel chatModel;
+    private final ChatProperties props;
     private final ZoneId zone;
-    private final int maxHistoryTurns;
-    private final String model;
-    private final int numPredict;
-    private final double temperature;
-    private final String systemPrompt;
     private final Cache<String, Conversation> conversations;
 
     @Autowired
-    public ChatService(
-            OllamaChatModel chatModel,
-            @Value("${app.chat.max-history-turns:20}") int maxHistoryTurns,
-            @Value("${app.chat.max-conversations:1000}") long maxConversations,
-            @Value("${app.chat.conversation-ttl-minutes:60}") long ttlMinutes,
-            @Value("${spring.ai.ollama.chat.options.model:qwen3.5:4b}") String model,
-            @Value("${spring.ai.ollama.chat.options.num-predict:512}") int numPredict,
-            @Value("${spring.ai.ollama.chat.options.temperature:0.2}") double temperature,
-            @Value("${app.chat.system-prompt:}") String systemPrompt,
-            @Value("${app.chat.timezone:Europe/Moscow}") String timezone) {
-        this(chatModel, maxHistoryTurns, maxConversations, Duration.ofMinutes(ttlMinutes), model,
-                numPredict, temperature, systemPrompt, timezone, Ticker.systemTicker());
-    }
+    public ChatService(OllamaChatModel chatModel, ChatProperties props) {
+        if (props.getConversationTtl().isNegative() || props.getConversationTtl().isZero()) {
+            throw new IllegalArgumentException("app.chat.conversation-ttl must be positive");
+        }
 
-    ChatService(
-            OllamaChatModel chatModel,
-            int maxHistoryTurns,
-            long maxConversations,
-            Duration conversationTtl,
-            String model,
-            int numPredict,
-            double temperature,
-            String systemPrompt,
-            String timezone,
-            Ticker ticker) {
-        if (maxHistoryTurns < 1) {
-            throw new IllegalArgumentException("app.chat.max-history-turns must be at least 1");
-        }
-        if (maxConversations < 1) {
-            throw new IllegalArgumentException("app.chat.max-conversations must be at least 1");
-        }
-        if (conversationTtl.isNegative() || conversationTtl.isZero()) {
-            throw new IllegalArgumentException("app.chat.conversation-ttl-minutes must be at least 1");
-        }
         this.chatModel = chatModel;
-        this.maxHistoryTurns = maxHistoryTurns;
-        this.model = model;
-        this.numPredict = numPredict;
-        this.temperature = temperature;
-        this.systemPrompt = systemPrompt == null ? "" : systemPrompt.strip();
-        this.zone = ZoneId.of(timezone);
+        this.props = props;
+        this.zone = ZoneId.of(props.getTimezone());
+
         this.conversations = Caffeine.newBuilder()
-                .maximumSize(maxConversations)
-                .expireAfterAccess(conversationTtl)
-                .ticker(ticker)
+                .maximumSize(props.getMaxConversations())
+                .expireAfterAccess(props.getConversationTtl())
+                .ticker(Ticker.systemTicker())
+                .removalListener((id, conversation, cause) -> {
+                    Conversation conv = (Conversation) conversation;
+                    if (conversation != null) {
+                        conv.clearHistory();
+                    }
+                })
                 .build();
     }
 
     public Flux<String> stream(String conversationId, String userMessage) {
         return Flux.defer(() -> {
-            Conversation conversation = conversations.get(conversationId, ignored -> new Conversation());
+                    Conversation conversation = conversations.get(conversationId, ignored -> new Conversation());
 
-            conversation.lock.acquireUninterruptibly();
-            AtomicReference<Usage> usage = new AtomicReference<>();
-            Flux<String> chunks;
-            try {
-                chunks = chatModel.stream(buildPrompt(conversation, userMessage))
-                        .doOnNext(chunk -> {
+                    conversation.lock.acquireUninterruptibly(); // блокирование
+                    AtomicReference<Usage> usage = new AtomicReference<>();
 
-                            Usage chunkUsage = usageOf(chunk);
-                            if (chunkUsage != null) {
-                                usage.set(chunkUsage);
-                            }
-                        })
-                        .map(ChatService::chunkText)
-                        .filter(text -> !text.isBlank());
-            } catch (RuntimeException exception) {
-                conversation.lock.release();
-                throw new ChatModelException(exception);
-            }
+                    Flux<String> chunks;
+                    try {
+                        chunks = chatModel.stream(buildPrompt(conversation, userMessage))
+                                .doOnNext(chunk -> {
+                                    Usage chunkUsage = usageOf(chunk);
+                                    if (chunkUsage != null) {
+                                        usage.set(chunkUsage);
+                                    }
+                                })
+                                .map(ChatService::chunkText)
+                                .filter(text -> !text.isBlank());
 
-            StringBuilder answer = new StringBuilder();
-            return chunks
-                    .doOnNext(answer::append)
-                    .doOnComplete(() -> {
-                        String assistantMessage = answer.toString();
-                        if (assistantMessage.isBlank()) {
-                            throw new IllegalStateException("Model returned an empty response");
-                        }
+                    } catch (RuntimeException exception) {
+                        conversation.lock.release();
+                        throw new ChatModelException(exception);
+                    }
+                    Mono<String> fullAnswerMono = chunks.collect(Collectors.joining()); //потоковая обработка внутри сервиса, но не потоковая выдача ответа клиенту.
+
+            return fullAnswerMono
+                    .flatMap(assistantMessage -> {
                         logUsage(conversationId, usage.get(), conversation.history.size());
+                        if (assistantMessage.isBlank())
+                        {
+                            assistantMessage = "Я пока не смог сформировать ответ.";
+                        }
                         remember(conversation, userMessage, assistantMessage);
-                    })
-                    .onErrorMap(error -> error instanceof ChatModelException
-                            ? error
-                            : new ChatModelException(error))
-                    .doFinally(signal -> conversation.lock.release());
-        }).subscribeOn(Schedulers.boundedElastic());
+                        return Mono.just(assistantMessage); })
+                    .flux()
+                    .onErrorMap(error -> error instanceof ChatModelException ? error : new ChatModelException("Error streaming chat response", error))
+                    .doFinally(signal -> conversation.lock.release()); //снятие блокировки
+        })
+                .subscribeOn(Schedulers.boundedElastic());
     }
 
-    private static Usage usageOf(ChatResponse response) {
-        if (response == null || response.getMetadata() == null) {
-            return null;
-        }
-        return response.getMetadata().getUsage();
+    private Prompt buildPrompt(Conversation conversation, String userMessage) {
+        List<Message> promptMessages = new ArrayList<>();
+
+        promptMessages.add(new SystemMessage(buildSystemPrompt()));
+        promptMessages.addAll(conversation.history);
+        promptMessages.add(new SystemMessage(buildTimeContext()));
+        promptMessages.add(new UserMessage(userMessage));
+
+        OllamaChatOptions options = OllamaChatOptions.builder()
+                .model(props.getDefaultModel())
+                .numPredict(props.getDefaultNumPredict())
+                .temperature(props.getDefaultTemperature())
+                .disableThinking()
+                .build();
+        return new Prompt(promptMessages, options);
     }
 
     private void logUsage(String conversationId, Usage usage, int historyMessages) {
@@ -150,35 +130,46 @@ public class ChatService {
         }
         Integer promptTokens = usage.getPromptTokens();
         Integer completionTokens = usage.getCompletionTokens();
-        log.info("Chat usage: conversation={}, promptTokens={}, completionTokens={}, "
-                        + "historyMessages={}, numPredict={}",
-                conversationId, promptTokens, completionTokens, historyMessages, numPredict);
-        if (completionTokens != null && completionTokens >= numPredict) {
+
+        log.info("Chat usage: conversation={}, promptTokens={}, completionTokens={}, historyMessages={}, numPredict={}",
+                conversationId, promptTokens, completionTokens, historyMessages, props.getDefaultNumPredict());
+
+        if (completionTokens != null && completionTokens >= props.getDefaultNumPredict()) {
             log.warn("Reply for conversation={} reached num-predict={} and was probably cut off",
-                    conversationId, numPredict);
+                    conversationId, props.getDefaultNumPredict());
         }
-    }
-
-    private Prompt buildPrompt(Conversation conversation, String userMessage) {
-        List<Message> promptMessages = new ArrayList<>();
-        promptMessages.add(new SystemMessage(buildSystemPrompt()));
-        promptMessages.addAll(conversation.history);
-        promptMessages.add(new SystemMessage(buildTimeContext()));
-        promptMessages.add(new UserMessage(userMessage));
-
-        OllamaChatOptions options = OllamaChatOptions.builder()
-                .model(model)
-                .numPredict(numPredict)
-                .temperature(temperature)
-                .disableThinking()
-                .build();
-        return new Prompt(promptMessages, options);
     }
 
     private void remember(Conversation conversation, String userMessage, String assistantMessage) {
         conversation.history.addLast(new UserMessage(userMessage));
         conversation.history.addLast(new AssistantMessage(assistantMessage));
         trimHistory(conversation.history);
+    }
+
+    private void trimHistory(ArrayDeque<Message> history) {
+        int maxMessages = props.getMaxHistoryTurns() * 2;
+        while (history.size() > maxMessages) {
+            Message oldest = history.pollFirst();
+            if (oldest instanceof UserMessage) {
+                history.pollFirst();
+            }
+        }
+    }
+
+    private String buildSystemPrompt() {
+        return props.getDefaultSystemPrompt();
+    }
+
+    private String buildTimeContext() {
+        return "Current date and time: " + TIME_FORMAT.format(ZonedDateTime.now(zone))
+                + ". Use it when the user asks about the date or time.";
+    }
+
+    private static Usage usageOf(ChatResponse response) {
+        if (response == null || response.getMetadata() == null) {
+            return null;
+        }
+        return response.getMetadata().getUsage();
     }
 
     private static String chunkText(ChatResponse chunk) {
@@ -189,25 +180,10 @@ public class ChatService {
         return text == null ? "" : text;
     }
 
-    private String buildSystemPrompt() {
-        return systemPrompt;
-    }
-
-    private String buildTimeContext() {
-        return "Current date and time: " + TIME_FORMAT.format(ZonedDateTime.now(zone))
-                + ". Use it when the user asks about the date or time.";
-    }
-
-    private void trimHistory(ArrayDeque<Message> history) {
-        int maxMessages = maxHistoryTurns * 2;
-        while (history.size() > maxMessages) {
-            history.removeFirst();
-            history.removeFirst();
-        }
-    }
-
     private static final class Conversation {
         private final ArrayDeque<Message> history = new ArrayDeque<>();
         private final Semaphore lock = new Semaphore(1);
+        void clearHistory()
+            { history.clear(); }
     }
 }
